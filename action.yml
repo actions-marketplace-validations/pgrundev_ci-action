@@ -1,0 +1,158 @@
+name: PGRun CI
+description: >-
+  Test every pull request against its own disposable, production-like
+  PostgreSQL database: sanitized production data on a copy-on-write PGX
+  branch, migrations and data-loss checks, automatic cleanup.
+author: PGRun
+branding:
+  icon: database
+  color: purple
+
+inputs:
+  token:
+    description: PGRun API token (a project CI token). Store it as the PGRUN_API_TOKEN secret.
+    required: true
+  mode:
+    description: "production-like (migrations + data checks on the sanitized copy) or fast (your test suite on schema-only branches, in parallel)."
+    default: production-like
+  project:
+    description: PGRun project name. Optional — a CI token belongs to exactly one project.
+    default: ""
+  engine:
+    description: "pgx (default: fail if a branch is not on PGX), postgres, or any (accept stock PostgreSQL)."
+    default: pgx
+  test-command:
+    description: >-
+      Optional command run against the branch (DATABASE_URL is set). Production-like: tests written for
+      populated data. Fast: replaces the built-in Rails preset; DATABASE_URL_1..N and PGRUN_WORKERS are set.
+    default: ""
+  migrate-command:
+    description: Migration command. Default for Rails — bin/rails db:migrate.
+    default: ""
+  prepare-command:
+    description: Fast mode — run on every branch after the migrations (e.g. load reference data).
+    default: ""
+  workers:
+    description: Fast mode — number of branches and test processes (1–16).
+    default: "4"
+  min-workers:
+    description: Fast mode — fewest workers to accept when the branch quota stays full (default half). Every test still runs.
+    default: ""
+  seed:
+    description: Fast mode — SQL file loaded into the schema-only CI template (e.g. db/ci_seed.sql).
+    default: ""
+  template:
+    description: Fast mode — CI template name.
+    default: ci
+  working-directory:
+    description: Directory of the application.
+    default: .
+  framework:
+    description: auto (detects Rails), rails, or none (set migrate-command / test-command).
+    default: auto
+  setup-ruby:
+    description: Install Ruby and the bundle with ruby/setup-ruby when the app is Rails. Set false if your job already did.
+    default: "true"
+  ruby-version:
+    description: Ruby version; auto reads .ruby-version, .tool-versions or the Gemfile.
+    default: auto
+  rails-env:
+    description: RAILS_ENV for migrations and tests.
+    default: test
+  capacity-wait:
+    description: Seconds to wait for the project's branch quota before failing.
+    default: "1200"
+  ttl:
+    description: Branch time-to-live, the backstop if a runner dies (e.g. 1h; PGRun caps CI-token branches at 6h).
+    default: 1h
+  snapshot-warn-hours:
+    description: Warn when the Safe Copy is older than this.
+    default: "24"
+  snapshot-max-hours:
+    description: Fail when the Safe Copy is older than this (0 = never).
+    default: "720"
+  profile-max-exact-rows:
+    description: Tables estimated above this many rows are profiled on a sample, not counted exactly.
+    default: "5000000"
+  profile-budget:
+    description: Seconds per data profile pass; tables beyond it are reported as not profiled.
+    default: "900"
+  profile-statement-timeout:
+    description: Seconds per profiling statement.
+    default: "120"
+  allow-public-repository:
+    description: >-
+      Production-like mode refuses to run in a public repository, whose Actions
+      logs anyone can read: your migrations and tests run on the sanitized copy
+      and could print it. Set true to accept that.
+    default: "false"
+  api-url:
+    description: PGRun API URL.
+    default: https://app.pgrun.dev
+
+outputs:
+  result:
+    description: PASS or FAIL
+    value: ${{ steps.run.outcome == 'success' && 'PASS' || 'FAIL' }}
+
+runs:
+  using: composite
+  steps:
+    - name: PGRun — detect the application
+      id: detect
+      shell: bash
+      env:
+        PGRUN_IN_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        PGRUN_IN_FRAMEWORK: ${{ inputs.framework }}
+        PGRUN_IN_RUBY_VERSION: ${{ inputs.ruby-version }}
+      run: '"$GITHUB_ACTION_PATH/lib/pgrun-ci" detect'
+
+    - name: PGRun — set up Ruby
+      if: steps.detect.outputs.framework == 'rails' && inputs.setup-ruby == 'true' && steps.detect.outputs.ruby-version != 'none'
+      # ruby/setup-ruby v1.329.0, pinned by commit.
+      uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a
+      with:
+        ruby-version: ${{ steps.detect.outputs.ruby-version }}
+        bundler-cache: true
+        working-directory: ${{ inputs.working-directory }}
+
+    - name: PGRun — ${{ inputs.mode }}
+      id: run
+      shell: bash
+      env:
+        PGRUN_API_TOKEN: ${{ inputs.token }}
+        PGRUN_API_URL: ${{ inputs.api-url }}
+        PGRUN_IN_API_URL: ${{ inputs.api-url }}
+        PGRUN_IN_MODE: ${{ inputs.mode }}
+        PGRUN_IN_PROJECT: ${{ inputs.project }}
+        PGRUN_IN_ENGINE: ${{ inputs.engine }}
+        PGRUN_IN_TEST_COMMAND: ${{ inputs.test-command }}
+        PGRUN_IN_MIGRATE_COMMAND: ${{ inputs.migrate-command }}
+        PGRUN_IN_PREPARE_COMMAND: ${{ inputs.prepare-command }}
+        PGRUN_IN_WORKERS: ${{ inputs.workers }}
+        PGRUN_IN_MIN_WORKERS: ${{ inputs.min-workers }}
+        PGRUN_IN_SEED: ${{ inputs.seed }}
+        PGRUN_IN_TEMPLATE: ${{ inputs.template }}
+        PGRUN_IN_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        PGRUN_IN_FRAMEWORK: ${{ inputs.framework }}
+        PGRUN_IN_RAILS_ENV: ${{ inputs.rails-env }}
+        PGRUN_IN_CAPACITY_WAIT: ${{ inputs.capacity-wait }}
+        PGRUN_IN_TTL: ${{ inputs.ttl }}
+        PGRUN_IN_SNAPSHOT_WARN_HOURS: ${{ inputs.snapshot-warn-hours }}
+        PGRUN_IN_SNAPSHOT_MAX_HOURS: ${{ inputs.snapshot-max-hours }}
+        PGRUN_IN_ALLOW_PUBLIC_REPOSITORY: ${{ inputs.allow-public-repository }}
+        PGRUN_PROFILE_MAX_EXACT_ROWS: ${{ inputs.profile-max-exact-rows }}
+        PGRUN_PROFILE_BUDGET: ${{ inputs.profile-budget }}
+        PGRUN_PROFILE_STATEMENT_TIMEOUT: ${{ inputs.profile-statement-timeout }}
+      run: '"$GITHUB_ACTION_PATH/lib/pgrun-ci" run'
+
+    # Normally a no-op: the run step deletes its branches itself, also on
+    # failure and cancellation. This catches a run step that was killed.
+    - name: PGRun — clean up
+      if: always()
+      shell: bash
+      env:
+        PGRUN_API_TOKEN: ${{ inputs.token }}
+        PGRUN_API_URL: ${{ inputs.api-url }}
+        PGRUN_IN_MODE: ${{ inputs.mode }}
+      run: '"$GITHUB_ACTION_PATH/lib/pgrun-ci" cleanup'

@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+# pgrundev/ci-action — the whole PGRun CI lifecycle behind one `uses:` step.
+#
+#   pgrun-ci detect     framework, Ruby version (step outputs for setup-ruby)
+#   pgrun-ci run        gates → branches → migrations → checks → tests → summary
+#   pgrun-ci cleanup    delete this run's branches (idempotent; if: always())
+#
+# Inputs arrive as PGRUN_IN_* environment variables, never interpolated into
+# shell text. Never prints a connection URL, a password or the API token.
+set -euo pipefail
+
+ACTION_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CLI_VERSION="0.4.0"
+# SHA-256 of the pgrun CLI release archives (github.com/pgrundev/pgrun-cli
+# releases, checksums.txt). Pinned here so a compromised download is refused.
+cli_sha256() {
+  case "$1" in
+    linux_amd64) echo 119ffa594d6a83e0490bd7370d4e933dfc159da6ff36d1f3d903d9e7aafe77a2 ;;
+    linux_arm64) echo 3ac8714520b244eb3c97cd55fbee2f49cafd5d50eabdbc63550ee80c2fb769a8 ;;
+  esac
+}
+
+# ------------------------------------------------------------------ inputs
+mode="${PGRUN_IN_MODE:-production-like}"
+api_url="${PGRUN_IN_API_URL:-https://app.pgrun.dev}"; api_url="${api_url%/}"
+case "$api_url" in   # the token goes in a header: never over plain HTTP to another host
+  https://*|http://127.0.0.1[:/]*|http://127.0.0.1|http://localhost[:/]*|http://localhost) ;;
+  *) echo "::error title=PGRun CI::api-url must be https://"; exit 1 ;;
+esac
+project_in="${PGRUN_IN_PROJECT:-}"
+engine="${PGRUN_IN_ENGINE:-pgx}"
+workdir="${PGRUN_IN_WORKING_DIRECTORY:-.}"
+framework_in="${PGRUN_IN_FRAMEWORK:-auto}"
+test_command="${PGRUN_IN_TEST_COMMAND:-}"
+migrate_command="${PGRUN_IN_MIGRATE_COMMAND:-}"
+prepare_command="${PGRUN_IN_PREPARE_COMMAND:-}"
+workers="${PGRUN_IN_WORKERS:-4}"
+min_workers="${PGRUN_IN_MIN_WORKERS:-}"
+seed="${PGRUN_IN_SEED:-}"
+template="${PGRUN_IN_TEMPLATE:-ci}"
+capacity_wait="${PGRUN_IN_CAPACITY_WAIT:-1200}"
+ttl="${PGRUN_IN_TTL:-1h}"
+warn_age_h="${PGRUN_IN_SNAPSHOT_WARN_HOURS:-24}"
+max_age_h="${PGRUN_IN_SNAPSHOT_MAX_HOURS:-720}"
+rails_env="${PGRUN_IN_RAILS_ENV:-test}"
+ready_timeout="${PGRUN_IN_READY_TIMEOUT:-300}"
+
+runtime="${RUNNER_TEMP:-/tmp}/pgrun-ci"
+mkdir -p "$runtime"; chmod 700 "$runtime"   # branch URLs live here while the run lasts
+state="$runtime/state"          # key=value lines this run's later steps read
+summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+log()   { echo "pgrun: $*"; }
+die()   { echo "::error title=PGRun CI::$*"; record result FAIL; record error "$*"; exit 1; }
+warn()  { echo "::warning title=PGRun CI::$*"; echo "$*" >> "$runtime/warnings"; }
+record(){ printf '%s=%s\n' "$1" "${2//$'\n'/ }" >> "$state"; }
+get()   { [ -f "$state" ] && grep "^$1=" "$state" | tail -1 | cut -d= -f2- || true; }
+now_ms(){ local n; n=$(date +%s%N); case "$n" in *N) echo $(( ${n%N} * 1000 )) ;; *) echo $(( n / 1000000 )) ;; esac; }
+timed() { local name="$1"; shift; local t; t=$(now_ms); "$@"; record "t_$name" $(( $(now_ms) - t )); }
+secs()  { [ -n "$1" ] && awk -v ms="$1" 'BEGIN { printf (ms < 10000 ? "%.1fs" : "%.0fs"), ms / 1000 }' || echo "—"; }
+
+# ----------------------------------------------------------------- API/CLI
+# Header via stdin config: the token never appears on a command line.
+api_get() {
+  local path="$1" out="$2" code
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$PGRUN_API_TOKEN" |
+         curl -sS -K - -o "$out" -w '%{http_code}' --max-time 30 --retry 3 --retry-connrefused \
+              -H 'Accept: application/json' -H "User-Agent: pgrun-ci-action/$CLI_VERSION" "$api_url$path") || code=000
+  echo "$code"
+}
+
+install_cli() {
+  if command -v pgrun > /dev/null && pgrun version 2>/dev/null | grep -q "$CLI_VERSION"; then return; fi
+  local arch
+  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "unsupported runner architecture $(uname -m)" ;; esac
+  [ "$(uname -s)" = Linux ] || die "PGRun CI runs on Linux runners (ubuntu-latest); this runner is $(uname -s)"
+  local name="pgrun_${CLI_VERSION}_linux_${arch}.tar.gz" dir="$runtime/bin"
+  mkdir -p "$dir"
+  curl -fsSL --retry 3 -o "$runtime/$name" "https://github.com/pgrundev/pgrun-cli/releases/download/v$CLI_VERSION/$name" \
+    || die "could not download the pgrun CLI $CLI_VERSION"
+  echo "$(cli_sha256 "linux_$arch")  $runtime/$name" | sha256sum -c --quiet - || die "pgrun CLI checksum mismatch — refusing to run it"
+  tar -xzf "$runtime/$name" -C "$dir" pgrun
+  export PATH="$dir:$PATH"
+  echo "$dir" >> "${GITHUB_PATH:-/dev/null}"
+}
+
+need_psql() {
+  command -v psql > /dev/null && return
+  log "installing the PostgreSQL client"
+  sudo apt-get -qq update > /dev/null && sudo apt-get -qq install -y --no-install-recommends postgresql-client > /dev/null \
+    || die "psql is not available and could not be installed"
+}
+
+# ------------------------------------------------------------ project/gates
+# GET /api/v1/ci/context when the server has it; otherwise the same facts from
+# the projects and sources endpoints every server already serves.
+resolve_context() {
+  local q="" code ctx="$runtime/context.json"
+  [ -n "$project_in" ] && q="?project=$(jq -rn --arg p "$project_in" '$p|@uri')"
+  code=$(api_get "/api/v1/ci/context$q" "$ctx")
+  case "$code" in
+    200) ;;
+    401) die "the PGRun API token was rejected (401). Create a CI token for the project in PGRun and store it as the PGRUN_API_TOKEN repository secret." ;;
+    403) die "the PGRun API token may not use project ${project_in:-of this run} ($(jq -r '.message // .error // empty' "$ctx" 2>/dev/null))." ;;
+    409) die "$(jq -r '.message // "this token can see several projects"' "$ctx") — set the action's \`project\` input to one of: $(jq -r '(.projects // []) | join(", ")' "$ctx")." ;;
+    404) if jq -e '.error == "no_project"' "$ctx" > /dev/null 2>&1; then die "this PGRun account has no project yet: connect a database in PGRun first."; fi
+         legacy_context "$ctx" ;;
+    000) die "cannot reach the PGRun API at $api_url" ;;
+    *)   die "the PGRun API answered $code for the CI context" ;;
+  esac
+  project=$(jq -r '.project.name' "$ctx")
+  [ -n "$project" ] && [ "$project" != null ] || die "the PGRun API did not name a project"
+  record project "$project"
+  export PGRUN_PROJECT="$project"
+}
+
+legacy_context() {
+  local ctx="$1" code list="$runtime/projects.json" src="$runtime/source.json"
+  code=$(api_get "/api/v1/projects" "$list")
+  [ "$code" = 401 ] && die "the PGRun API token was rejected (401). Store a valid PGRun API token as the PGRUN_API_TOKEN repository secret."
+  [ "$code" = 200 ] || die "the PGRun API answered $code for the project list"
+  if [ -z "$project_in" ]; then
+    local n; n=$(jq '.projects | length' "$list")
+    [ "$n" -eq 0 ] && die "this PGRun account has no project yet: connect a database in PGRun first."
+    [ "$n" -gt 1 ] && die "this token can see $n projects — set the action's \`project\` input to one of: $(jq -r '[.projects[].name] | join(", ")' "$list")."
+    project_in=$(jq -r '.projects[0].name' "$list")
+  elif ! jq -e --arg p "$project_in" '.projects[] | select(.name == $p)' "$list" > /dev/null; then
+    die "project $project_in is not visible to this token"
+  fi
+  code=$(api_get "/api/v1/sources/$(jq -rn --arg p "$project_in" '$p|@uri')" "$src")
+  [ "$code" = 200 ] || die "the PGRun API answered $code for project $project_in"
+  jq --arg p "$project_in" '{
+      project: {name: $p}, token: {scope: "account"},
+      source: {postgres_version: .postgres_version, schema_changed: .schema_changed},
+      protect: {status: .protection, policy_version: .policy_version, weakening_pending: .weakening_pending},
+      safe_copy: {status: .safe_copy_status, updated_at: .safe_copy_updated_at, policy_version: .policy_version,
+                  last_refresh_failed: .last_refresh_failed},
+      pgx: null, capacity: null, allowances: null, legacy: true}' "$src" > "$ctx"
+}
+
+check_gates() {
+  local ctx="$runtime/context.json" protect copy updated age_h pv
+  protect=$(jq -r '.protect.status // "none"' "$ctx")
+  copy=$(jq -r '.safe_copy.status // "none"' "$ctx")
+  updated=$(jq -r '.safe_copy.updated_at // empty' "$ctx")
+  pv=$(jq -r '.safe_copy.policy_version // .protect.policy_version // empty' "$ctx")
+  record source_version "$(jq -r '.source.postgres_version // empty' "$ctx")"
+  record policy_version "$pv"
+  record copy_updated "$updated"
+  [ "$protect" = active ] || die "Protect is not approved for $project (status: $protect). Review and approve the data protection policy at $api_url/sources/$project/protect — nothing was provisioned."
+  [ "$(jq -r '.safe_copy.policy_revoked // false' "$ctx")" = true ] && die "the Safe Copy of $project was made under a revoked policy (v$pv). Refresh it from PGRun before running CI."
+  case "$copy" in
+    ready) ;;
+    action_required)
+      [ -n "$updated" ] || die "$project has no Safe Copy yet: approve Protect and create the Safe Copy in PGRun."
+      if [ "$(jq -r '.protect.weakening_pending // .protect.pending_reapproval // false' "$ctx")" = true ]; then
+        warn "Protect has unapproved changes; this run uses the approved Safe Copy (policy v$pv)."
+      elif [ "$(jq -r '.source.schema_changed // false' "$ctx")" = true ]; then
+        warn "production's schema changed since the Safe Copy; migrations already deployed are applied on top of it in this run."
+      else
+        warn "the Safe Copy of $project needs attention in PGRun (status action_required); this run uses it as approved (policy v$pv)."
+      fi ;;
+    copying)  [ -n "$updated" ] && warn "a Safe Copy refresh is in progress; branches come from the current copy." \
+                || die "the first Safe Copy of $project is still being created — re-run when it is ready." ;;
+    failed)   die "the Safe Copy of $project failed. See $api_url/sources/$project — nothing was provisioned." ;;
+    *)        die "$project has no Safe Copy yet (status: $copy). Approve Protect and create the Safe Copy in PGRun." ;;
+  esac
+  [ -n "$updated" ] || die "$project has no Safe Copy yet."
+  age_h=$(python3 -c 'import sys, datetime as d; t = d.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); print(int((d.datetime.now(d.timezone.utc) - t).total_seconds() // 3600))' "$updated")
+  record copy_age_h "$age_h"
+  [ "$max_age_h" -gt 0 ] && [ "$age_h" -ge "$max_age_h" ] && die "the Safe Copy is ${age_h}h old (snapshot-max-age-hours: $max_age_h). Refresh it in PGRun, or raise the limit."
+  [ "$age_h" -ge "$warn_age_h" ] && warn "the Safe Copy is ${age_h}h old; production may have moved on."
+  # `//` would read false as missing: compare the value itself.
+  if [ "$engine" = pgx ] && [ "$(jq -r 'if .pgx == null or .pgx.eligible == null then "unknown" else (.pgx.eligible | tostring) end' "$ctx")" = false ]; then
+    die "PGX is required (engine: pgx) but $project is not eligible: $(jq -r '.pgx.reason // .pgx.verdict // "no verdict"' "$ctx"). Nothing was provisioned. Set engine: any to allow stock PostgreSQL."
+  fi
+  if [ "$(jq -r '.allowances | type' "$ctx")" = array ]; then
+    jq '.allowances' "$ctx" > "$runtime/allowances.json"
+  else
+    echo '[]' > "$runtime/allowances.json"
+    record allowances_note "this PGRun server does not serve approved allowances yet: any data loss fails"
+  fi
+  log "project $project · Protect active (policy v$pv) · Safe Copy $copy, ${age_h}h old"
+}
+
+# --------------------------------------------------------------- branches
+prefix() {
+  local pr=""
+  [[ "${GITHUB_REF:-}" =~ ^refs/pull/([0-9]+)/ ]] && pr="${BASH_REMATCH[1]}"
+  local m; [ "$mode" = fast ] && m=fast || m=pl
+  echo "ci-$m-${pr:-run}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}" | tr 'A-Z' 'a-z'
+}
+
+our_branches() {   # names of this run's branches, never their URLs
+  pgrun branch list "$PGRUN_PROJECT" --json | jq -r --arg p "$1-" \
+    '.branches[] | select(.name | startswith($p)) | select(.name[($p | length):] | test("^[0-9]+$")) | .name'
+}
+
+delete_prefix() {
+  local p="$1" names t; t=$(now_ms)
+  names=$(our_branches "$p" 2>/dev/null) || { log "could not list branches; their ${ttl} TTL still applies"; return 0; }
+  for name in $names; do
+    pgrun branch delete "$PGRUN_PROJECT" "$name" > /dev/null 2>&1 &
+  done
+  wait || true
+  local n; n=$(grep -c . <<< "$names" || true)
+  log "deleted $n branch(es) in $(( $(now_ms) - t )) ms"
+  record cleanup "deleted $n"
+}
+
+create_branches() {   # <prefix> <min> <max> [create flags]
+  local p="$1" min="$2" max="$3"; shift 3
+  local start waited=0 since=0 err seq=0 names=()
+  start=$(now_ms)
+  while [ "${#names[@]}" -lt "$max" ]; do
+    seq=$(( seq + 1 ))   # never reuse a name: a released one may still be deleting
+    local name="$p-$seq"
+    if err=$(pgrun branch create "$PGRUN_PROJECT" --name "$name" --ttl "$ttl" "$@" 2>&1 > /dev/null); then
+      names+=("$name"); since=0; continue
+    fi
+    grep -q "quota" <<< "$err" || { delete_prefix "$p"; die "creating a branch failed: $(sanitize "$err")"; }
+    if [ "${#names[@]}" -ge "$min" ] && [ "$since" -ge "${PGRUN_PARTIAL_WAIT:-60}" ]; then
+      warn "branch quota full: continuing with ${#names[@]} of $max workers (min-workers $min) — every test still runs"
+      break
+    fi
+    [ "$waited" -ge "$capacity_wait" ] && { delete_prefix "$p"; die "no capacity for $min branch(es) after ${capacity_wait}s: the project's branch quota is in use by other runs ($(sanitize "$err"))."; }
+    [ "$waited" -eq 0 ] && log "project branch quota full — waiting for capacity (up to ${capacity_wait}s)"
+    # Holding fewer than min only blocks other runs: give them back, retry later.
+    if [ "${#names[@]}" -gt 0 ] && [ "${#names[@]}" -lt "$min" ]; then
+      for n in ${names[@]+"${names[@]}"}; do pgrun branch delete "$PGRUN_PROJECT" "$n" > /dev/null 2>&1 || true; done
+      names=()
+    fi
+    local base="${PGRUN_RETRY_PAUSE:-15}" pause
+    pause=$(( base + RANDOM % (base + 1) ))
+    sleep "$pause"; waited=$(( waited + pause )); since=$(( since + pause ))
+  done
+  record capacity_wait_s "$waited"
+  record t_create $(( $(now_ms) - start ))
+  local deadline=$(( $(date +%s) + ready_timeout )) i=0 url pw
+  for name in ${names[@]+"${names[@]}"}; do
+    i=$(( i + 1 ))
+    until pgrun branch get "$PGRUN_PROJECT" "$name" 2>/dev/null | grep -q 'status=ready'; do
+      [ "$(date +%s)" -ge "$deadline" ] && { delete_prefix "$p"; die "branch $name was not ready after ${ready_timeout}s"; }
+      sleep 1
+    done
+    url=$(pgrun branch url "$PGRUN_PROJECT" "$name"); url="${url#DATABASE_URL=}"
+    echo "::add-mask::$url"
+    # The password on its own too: a migration or test may print it apart from the URL.
+    pw=$(PGRUN_URL="$url" python3 -c 'import os, urllib.parse as u; print(u.unquote(u.urlsplit(os.environ["PGRUN_URL"]).password or ""))')
+    [ -n "$pw" ] && echo "::add-mask::$pw"
+    (umask 077; printf '%s' "$url" > "$runtime/url_$i")
+  done
+  record t_ready $(( $(now_ms) - start ))
+  record branches "${#names[@]}"
+  # The engine each branch ACTUALLY runs on (a fallback reports postgres).
+  local engines wrong
+  engines=$(pgrun branch list "$PGRUN_PROJECT" --json | jq -r --arg p "$p-" '.branches[] | select(.name | startswith($p)) | "\(.name) \(.engine // "unknown")"')
+  record engines "$(awk '{print $2}' <<< "$engines" | sort | uniq -c | awk '{printf "%s%s=%s", s, $2, $1; s=" "}')"
+  log "${#names[@]} branch(es) ready in $(secs "$(get t_ready)") · engines: $(get engines)"
+  if [ "$engine" != any ]; then
+    wrong=$(awk -v want="$engine" '$2 != want' <<< "$engines")
+    if [ -n "$wrong" ]; then
+      while read -r n e; do [ -n "$n" ] && echo "::error title=PGRun CI::$n runs on $e, not $engine — no silent fallback to stock PostgreSQL"; done <<< "$wrong"
+      delete_prefix "$p"; die "the branch engine is not $engine (engine input). PGRun could not place the branch on $engine; nothing ran."
+    fi
+  fi
+}
+
+sanitize() { sed -E 's#postgres(ql)?://[^ ]+#<url>#g; s/pgrun_(ci_)?[0-9a-f]{8,}/<token>/g' <<< "$1" | head -40; }
+
+url_of() { cat "$runtime/url_$1"; }
+
+# ------------------------------------------------------------ framework
+detect() {
+  cd "$workdir"
+  local fw="$framework_in" ruby=""
+  if [ "$fw" = auto ]; then
+    if [ -f Gemfile ] && [ -f config/application.rb ] && { [ -x bin/rails ] || grep -qE '^    rails \(' Gemfile.lock 2>/dev/null; }; then fw=rails; else fw=none; fi
+  fi
+  if [ "$fw" = rails ]; then
+    if [ -n "${PGRUN_IN_RUBY_VERSION:-}" ] && [ "${PGRUN_IN_RUBY_VERSION}" != auto ]; then ruby="$PGRUN_IN_RUBY_VERSION"
+    elif [ -f .ruby-version ]; then ruby=$(tr -d ' \n' < .ruby-version)
+    elif [ -f .tool-versions ] && grep -q '^ruby ' .tool-versions; then ruby=$(awk '$1 == "ruby" { print $2 }' .tool-versions)
+    elif grep -qE "^ruby ['\"]" Gemfile; then ruby=$(sed -nE "s/^ruby ['\"]([^'\"]+)['\"].*/\1/p" Gemfile | head -1)
+    elif grep -q '^RUBY VERSION' Gemfile.lock 2>/dev/null; then ruby=$(awk '/^RUBY VERSION/ { getline; print $2 }' Gemfile.lock | sed 's/p[0-9]*$//')
+    fi
+    [ -n "$ruby" ] || ruby=none
+  fi
+  echo "$fw" > "$runtime/framework"
+  echo "framework=$fw" >> "${GITHUB_OUTPUT:-/dev/null}"
+  echo "ruby-version=${ruby:-none}" >> "${GITHUB_OUTPUT:-/dev/null}"
+  log "framework: $fw${ruby:+ · Ruby $ruby}"
+  if [ "$fw" = rails ] && [ "$ruby" = none ] && ! command -v ruby > /dev/null; then
+    die "Rails app without a Ruby version: add .ruby-version (or a \`ruby\` line to the Gemfile), or set the action's ruby-version input."
+  fi
+}
+
+rails_preflight() {
+  [ -f Gemfile.lock ] || die "Gemfile.lock is missing: commit it so the bundle is reproducible."
+  grep -qE '^    pg \(' Gemfile.lock || die "the Rails app does not use the pg gem (Gemfile.lock) — PGRun CI needs PostgreSQL via ActiveRecord."
+  command -v bundle > /dev/null || die "bundler is not available: the action sets up Ruby only when setup-ruby is true."
+  bundle check > /dev/null 2>&1 || die "the bundle is not installed. Keep setup-ruby: true (default), or run bundle install before this step."
+}
+
+migrate_cmd() {
+  if [ -n "$migrate_command" ]; then echo "$migrate_command"; return; fi
+  case "$framework" in
+    rails) echo "bin/rails db:migrate" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Long commands run in the background and are waited for: bash runs a trap
+# only once its foreground command has finished, but `wait` returns at once
+# when a signal arrives — so a cancellation is handled in seconds.
+CHILD=""
+bg() { "$@" & CHILD=$!; local rc=0; wait "$CHILD" || rc=$?; CHILD=""; return "$rc"; }
+
+# Customer code (migrations, tests) runs with the branch URL only: the PGRun
+# token is not in its environment.
+run_app() {   # <branch index> <command string> [extra env...]
+  local i="$1" cmd="$2"; shift 2
+  bg env -u PGRUN_API_TOKEN DATABASE_URL="$(url_of "$i")" RAILS_ENV="$rails_env" PGRUN_BRANCH_INDEX="$i" "$@" bash -c "$cmd"
+}
+
+applied_versions() {   # migration identifiers on branch <i>, one per line
+  DATABASE_URL="$(url_of "$1")" python3 - <<'PY'
+import json, os, subprocess, sys
+sys.path.insert(0, os.environ["PGRUN_ACTION_DIR"] + "/lib")
+from pgrun_profile import conninfo_env
+env = dict(os.environ); env.update(conninfo_env(os.environ["DATABASE_URL"])); env.pop("DATABASE_URL")
+for table, col in (("schema_migrations", "version"), ("django_migrations", "app || '.' || name"), ("flyway_schema_history", "version"), ("_prisma_migrations", "migration_name")):
+    r = subprocess.run(["psql", "-X", "-At", "-c", "SELECT (%s)::text FROM %s ORDER BY 1" % (col, table)], env=env, capture_output=True, text=True)
+    if r.returncode == 0:
+        print(r.stdout.strip()); break
+PY
+}
+
+profile_capture() {   # <out.json> — the profiler reads the branch, never the token
+  local rails_flag=(); [ "$framework" = rails ] && rails_flag=(--rails)
+  bg env -u PGRUN_API_TOKEN DATABASE_URL="$(url_of 1)" python3 "$ACTION_DIR/lib/pgrun_profile.py" capture "$1" ${rails_flag[@]+"${rails_flag[@]}"}
+}
+
+# ------------------------------------------------------------ production-like
+production_like() {
+  local p; p=$(prefix); record prefix "$p"
+  create_branches "$p" 1 1
+  local mig; mig=$(migrate_cmd)
+  [ -n "$mig" ] || die "no migration command: framework ${framework} is not supported yet — set migrate-command."
+
+  log "data profile before the migrations"
+  timed profile_before profile_capture "$runtime/before.json"
+  applied_versions 1 | LC_ALL=C sort > "$runtime/versions_before" || true
+  python3 "$ACTION_DIR/lib/pgrun_profile.py" migrations --root . > "$runtime/migration_files" || : > "$runtime/migration_files"
+
+  # Normally one step. When a pending migration has an approval matching its
+  # file, Rails' default command runs it on its own, profiled before and after,
+  # so its approval excuses only what that migration did.
+  local steps="batch"
+  if [ "$framework" = rails ] && [ -z "$migrate_command" ]; then
+    steps=$(python3 "$ACTION_DIR/lib/pgrun_profile.py" plan --files "$runtime/migration_files" \
+              --before "$runtime/versions_before" --allowances "$runtime/allowances.json") || steps="batch"
+  fi
+  local nsteps; nsteps=$(grep -c . <<< "$steps")
+  [ "$nsteps" -gt 1 ] && log "an approved migration is pending: applying the migrations in $nsteps steps, each profiled"
+
+  log "applying migrations: $mig"
+  local t t_mig=0 t_prof=0 k=0 prev="$runtime/before.json" kind versions cmd data=PASS
+  : > "$runtime/compare.md"; : > "$runtime/migrate.log"; : > "$runtime/applied"
+  # fd 3: the migrations themselves must not read the plan from stdin.
+  while IFS=$'\t' read -r -u 3 kind versions; do
+    k=$(( k + 1 ))
+    if [ "$k" -lt "$nsteps" ]; then
+      cmd=""; for v in $versions; do cmd="${cmd:+$cmd && }bin/rails db:migrate:up VERSION=$v"; done
+    else
+      cmd="$mig"   # the last step runs the real command, which also catches anything not planned
+    fi
+    t=$(now_ms)
+    if run_app 1 "$cmd" >> "$runtime/migrate.log" 2>&1; then :; else
+      record migrations FAIL
+      sanitize "$(tail -40 "$runtime/migrate.log")"; die "the migrations failed on the production-like branch (last lines above)."
+    fi
+    t_mig=$(( t_mig + $(now_ms) - t ))
+    applied_versions 1 | LC_ALL=C sort > "$runtime/versions_after" || true
+    LC_ALL=C comm -13 "$runtime/versions_before" "$runtime/versions_after" > "$runtime/step_versions"
+    cp "$runtime/versions_after" "$runtime/versions_before"
+    # version<TAB>sha256 of the file that ran ("-" when no single file matches)
+    awk -F'\t' 'FILENAME == ARGV[1] { sha[$1] = $2; next } { print $1 "\t" (($1 in sha) ? sha[$1] : "-") }' \
+      "$runtime/migration_files" "$runtime/step_versions" > "$runtime/step_applied"
+    cat "$runtime/step_applied" >> "$runtime/applied"
+    [ "$nsteps" -gt 1 ] && log "step $k/$nsteps ($kind): $(cut -f1 "$runtime/step_applied" | tr '\n' ' ')"
+    log "data profile after$([ "$nsteps" -gt 1 ] && echo " step $k"), compared"
+    t=$(now_ms)
+    profile_capture "$runtime/after_$k.json"
+    t_prof=$(( t_prof + $(now_ms) - t ))
+    [ "$nsteps" -gt 1 ] && printf '\n**Step %s of %s** (%s): %s\n\n' "$k" "$nsteps" "$kind" "$(cut -f1 "$runtime/step_applied" | tr '\n' ' ')" >> "$runtime/compare.md"
+    python3 "$ACTION_DIR/lib/pgrun_profile.py" compare "$prev" "$runtime/after_$k.json" \
+         --applied "$runtime/step_applied" --allowances "$runtime/allowances.json" \
+         --result "$runtime/compare_$k.json" --markdown "$runtime/compare_step.md" || data=FAIL
+    cat "$runtime/compare_step.md" >> "$runtime/compare.md"
+    cp "$runtime/compare_$k.json" "$runtime/compare.json"
+    prev="$runtime/after_$k.json"
+  done 3<<< "$steps"
+  record migrations PASS
+  record t_migrate "$t_mig"
+  record t_profile_after "$t_prof"
+  record data "$data"
+  grep -E '^(==|-- )' "$runtime/migrate.log" | head -60 || true
+  record applied_count "$(grep -c . "$runtime/applied" || true)"
+  if [ -s "$runtime/applied" ]; then
+    { echo; echo "<details><summary>$(grep -c . "$runtime/applied") migration(s) applied, with the SHA-256 an approval must name</summary>"; echo
+      awk -F'\t' 'FILENAME == ARGV[1] { path[$1] = $3; next } { printf "- `%s` %s `%s`\n", $1, path[$1], $2 }' "$runtime/migration_files" "$runtime/applied"
+      echo; echo "</details>"; } >> "$runtime/compare.md"
+  fi
+  if [ "$framework" = rails ] && ! run_app 1 "bin/rails db:abort_if_pending_migrations" > /dev/null 2>&1; then
+    die "migrations are still pending after $mig."
+  fi
+
+  if [ -n "$test_command" ]; then
+    log "application tests: $test_command"
+    t=$(now_ms)
+    if run_app 1 "$test_command"; then record tests PASS; else record tests FAIL; fi
+    record t_tests $(( $(now_ms) - t ))
+  else
+    record tests "NOT CONFIGURED"
+  fi
+  [ "$(get data)" = PASS ] || die "data checks failed — see the summary for the table, column or constraint."
+  [ "$(get tests)" != FAIL ] || die "the application tests failed on the production-like branch."
+  record result PASS
+}
+
+# --------------------------------------------------------------------- fast
+fast() {
+  [[ "$workers" =~ ^[0-9]+$ ]] && [ "$workers" -ge 1 ] && [ "$workers" -le 16 ] || die "workers must be 1..16"
+  local min="${min_workers:-$(( (workers + 1) / 2 ))}"
+  [ "$min" -le "$workers" ] || die "min-workers ($min) is larger than workers ($workers)"
+  local seed_flag=()
+  if [ -n "$seed" ]; then [ -f "$seed" ] || die "seed file $seed not found"; seed_flag=(--seed "$seed"); fi
+  local t; t=$(now_ms)
+  log "CI template $template (schema only; rebuilt only when the schema or seed changed)"
+  pgrun template create "$PGRUN_PROJECT" "$template" --schema-only ${seed_flag[@]+"${seed_flag[@]}"} --wait --timeout 20m > "$runtime/template.log" 2>&1 \
+    || { sanitize "$(tail -5 "$runtime/template.log")"; die "the CI template could not be built"; }
+  record t_template $(( $(now_ms) - t ))
+  local p; p=$(prefix); record prefix "$p"
+  create_branches "$p" "$min" "$workers" --template "$template"
+  local n; n=$(get branches)
+
+  local mig; mig=$(migrate_cmd)
+  t=$(now_ms)
+  if [ -n "$mig$prepare_command" ]; then
+    log "preparing $n branch(es): ${mig}${prepare_command:+ && $prepare_command}"
+    local pids=() failed=0
+    for i in $(seq 1 "$n"); do
+      run_app "$i" "${mig:-true}${prepare_command:+ && $prepare_command}" > "$runtime/prepare_$i.log" 2>&1 & pids+=($!)
+    done
+    for i in "${!pids[@]}"; do wait "${pids[$i]}" || { failed=$((failed + 1)); echo "--- branch $((i + 1)):"; sanitize "$(tail -20 "$runtime/prepare_$((i + 1)).log")"; }; done
+    [ "$failed" -eq 0 ] || { record migrations FAIL; die "preparing $failed of $n branch(es) failed (migrations or prepare-command)"; }
+  fi
+  record migrations PASS
+  record t_prepare $(( $(now_ms) - t ))
+
+  t=$(now_ms)
+  local urls=(); for i in $(seq 1 "$n"); do urls+=("DATABASE_URL_$i=$(url_of "$i")"); done
+  if [ -n "$test_command" ]; then
+    log "tests: $test_command (PGRUN_WORKERS=$n, DATABASE_URL_1..$n)"
+    if run_app 1 "$test_command" PGRUN_WORKERS="$n" ${urls[@]+"${urls[@]}"}; then record tests PASS; else record tests FAIL; fi
+  elif [ "$framework" = rails ]; then
+    shard_tests "$n" ${urls[@]+"${urls[@]}"}
+  else
+    die "no test-command, and no test preset for framework $framework"
+  fi
+  record t_tests $(( $(now_ms) - t ))
+  [ "$(get tests)" = PASS ] || die "tests failed"
+  record result PASS
+}
+
+# Rails preset: split the test files into N groups (by recorded runtime when a
+# parallel_tests runtime log exists, else by size) and run one process per
+# branch, each with its own DATABASE_URL. Nothing to configure in the app.
+shard_tests() {
+  local n="$1"; shift
+  local runner files
+  if [ -d spec ] && grep -qE '^    rspec-core \(' Gemfile.lock; then runner=rspec; files=$(find spec -name '*_spec.rb' -not -path 'spec/fixtures/*' | sort)
+  elif [ -d test ]; then runner=minitest; files=$(find test -name '*_test.rb' -not -path 'test/system/*' | sort)
+  else die "no spec/ (RSpec) or test/ (Minitest) directory: set test-command"; fi
+  [ -n "$files" ] || die "no test files found for the $runner preset"
+  printf '%s\n' "$files" > "$runtime/test_files"
+  python3 - "$n" "$runtime" <<'PY'
+import os, sys
+n, out = int(sys.argv[1]), sys.argv[2]
+files = [l.rstrip("\n") for l in open(os.path.join(out, "test_files")) if l.strip()]
+weights = {}
+for log in ("spec/parallel_runtime_rspec.log", "tmp/parallel_runtime_rspec.log", "tmp/parallel_runtime_test.log"):
+    if os.path.exists(log):
+        for line in open(log):
+            f, _, t = line.strip().rpartition(":")
+            try: weights[f] = float(t)
+            except ValueError: pass
+avg = (sum(weights.values()) / len(weights)) if weights else None
+def w(f): return weights.get(f, avg) if avg is not None else os.path.getsize(f)
+groups = [[] for _ in range(n)]; load = [0.0] * n
+for f in sorted(files, key=w, reverse=True):
+    i = load.index(min(load)); groups[i].append(f); load[i] += w(f)
+for i, g in enumerate(groups, 1):
+    open(os.path.join(out, "group_%d" % i), "w").write("\n".join(g))
+print("pgrun: %d test files in %d groups (%s)" % (len(files), sum(1 for g in groups if g), "by recorded runtime" if weights else "by file size"))
+PY
+  local pids=() i
+  for i in $(seq 1 "$n"); do
+    local cmd
+    # Fewer files than branches: an empty group would run the whole suite.
+    [ -s "$runtime/group_$i" ] || continue
+    # NUL-separated: file names may contain spaces (and xargs -d is GNU-only).
+    if [ "$runner" = rspec ]; then cmd="tr '\\n' '\\0' < $runtime/group_$i | xargs -0 bundle exec rspec --format progress --format json --out $runtime/rspec_$i.json"
+    else cmd="tr '\\n' '\\0' < $runtime/group_$i | xargs -0 bin/rails test"; fi
+    run_app "$i" "$cmd" TEST_ENV_NUMBER="$([ "$i" -eq 1 ] && echo '' || echo "$i")" PARALLEL_WORKERS=1 "$@" > "$runtime/tests_$i.log" 2>&1 & pids+=($!)
+  done
+  local failed=0
+  for i in "${!pids[@]}"; do wait "${pids[$i]}" || failed=$((failed + 1)); done
+  for i in $(seq 1 "$n"); do [ -f "$runtime/tests_$i.log" ] || continue; echo "::group::test process $i"; cat "$runtime/tests_$i.log"; echo "::endgroup::"; done
+  if [ "$runner" = rspec ]; then
+    jq -s '{examples: (map(.summary.example_count) | add), failures: (map(.summary.failure_count) | add), pending: (map(.summary.pending_count) | add)}' \
+      "$runtime"/rspec_*.json > "$runtime/rspec.json" 2>/dev/null || true
+    record test_counts "$(jq -r '"\(.examples) examples, \(.failures) failures, \(.pending) pending"' "$runtime/rspec.json" 2>/dev/null || true)"
+    log "rspec: $(get test_counts)"
+  fi
+  if [ "$failed" -eq 0 ]; then record tests PASS; else record tests FAIL; fi
+}
+
+# ------------------------------------------------------------------ summary
+write_summary() {
+  local result; result=$(get result); result="${result:-FAIL}"
+  local title; [ "$mode" = fast ] && title="PGRun Fast CI" || title="PGRun Production-like CI"
+  {
+    echo "## $title — $([ "$result" = PASS ] && echo '✅ PASS' || echo '❌ FAIL')"
+    echo
+    [ -n "$(get error)" ] && { echo "> $(get error)"; echo; }
+    echo "| | |"
+    echo "|---|---|"
+    echo "| Project | $(get project) |"
+    [ -n "$(get source_version)" ] && echo "| Source | PostgreSQL $(get source_version) |"
+    [ -n "$(get engines)" ] && echo "| Engine | $(get engines | sed 's/pgx=/PGX ×/; s/postgres=/PostgreSQL ×/') |"
+    [ -n "$(get policy_version)" ] && echo "| Snapshot | approved and sanitized (policy v$(get policy_version)) |"
+    [ -n "$(get copy_updated)" ] && echo "| Snapshot freshness | $(get copy_updated) ($(get copy_age_h)h old) |"
+    if [ -f "$runtime/compare.json" ]; then
+      echo "| Tables analyzed | $(jq -r '.tables' "$runtime/compare.json") ($(jq -r '.modes | to_entries | map("\(.value) \(.key)") | join(", ")' "$runtime/compare.json")) |"
+    fi
+    [ -n "$(get branches)" ] && echo "| Branch ready | $(secs "$(get t_ready)") ($(get branches) branch$([ "$(get branches)" = 1 ] || echo es)$([ "$(get capacity_wait_s)" != 0 ] && [ -n "$(get capacity_wait_s)" ] && echo ", waited $(get capacity_wait_s)s for capacity")) |"
+    [ -n "$(get t_template)" ] && echo "| CI template | $(secs "$(get t_template)") |"
+    [ -n "$(get migrations)" ] && echo "| Migrations | $(get migrations)$([ -n "$(get applied_count)" ] && echo " — $(get applied_count) applied") ($(secs "$(get t_migrate)$(get t_prepare)")) |"
+    [ -n "$(get data)" ] && echo "| Data integrity | $(get data) (profile $(secs "$(get t_profile_before)") + $(secs "$(get t_profile_after)")) |"
+    [ -n "$(get tests)" ] && echo "| Application tests | $(get tests)$([ -n "$(get test_counts)" ] && echo " — $(get test_counts)")$([ -n "$(get t_tests)" ] && echo " ($(secs "$(get t_tests)"))") |"
+    [ -n "$(get cleanup)" ] && echo "| Cleanup | completed ($(get cleanup)) |"
+    echo "| Result | **$result** |"
+    echo
+    [ -f "$runtime/compare.md" ] && cat "$runtime/compare.md"
+    [ -n "$(get allowances_note)" ] && echo "- note: $(get allowances_note)"
+    [ -f "$runtime/warnings" ] && sed 's/^/- ⚠️ /' "$runtime/warnings"
+    true
+  } >> "$summary"
+}
+
+# --------------------------------------------------------------------- main
+finish() {
+  local code=$?
+  trap - INT TERM EXIT
+  if [ -n "$(get prefix)" ] && [ -z "$(get cleaned)" ]; then delete_prefix "$(get prefix)"; record cleaned 1; fi
+  rm -f "$runtime"/url_*
+  [ -z "$(get summary_written)" ] && { write_summary; record summary_written 1; }
+  exit "$code"
+}
+
+on_signal() {
+  trap '' INT TERM
+  [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+  pkill -TERM -P $$ 2>/dev/null || true
+  echo "::warning title=PGRun CI::cancelled — deleting this run's branches"
+  record result CANCELLED
+  record error "the run was cancelled"
+  exit 130   # → finish
+}
+
+main_run() {
+  : > "$state"
+  export PGRUN_ACTION_DIR="$ACTION_DIR"
+  [ -n "${PGRUN_API_TOKEN:-}" ] || die "no PGRun token: the \`token\` input is empty. A pull request from a fork gets no secrets — run PGRun CI only for branches of this repository (see the README's \`if:\`), and store the token as the PGRUN_API_TOKEN secret."
+  if [ "${GITHUB_EVENT_NAME:-}" = pull_request_target ]; then
+    die "refusing to run on pull_request_target: it would hand PR code the PGRun token. Use pull_request."
+  fi
+  case "$mode" in production-like|fast) ;; *) die "mode must be production-like or fast (got: $mode)" ;; esac
+  if [ "$mode" = production-like ] && [ "${PGRUN_IN_ALLOW_PUBLIC_REPOSITORY:-false}" != true ] \
+     && [ -f "${GITHUB_EVENT_PATH:-}" ] && [ "$(jq -r '.repository.private // empty' "$GITHUB_EVENT_PATH")" = false ]; then
+    die "this repository is public: anyone can read its Actions logs, and production-like mode runs your migrations and tests on the sanitized copy, which they could print. Use a private repository, or set allow-public-repository: true to accept this."
+  fi
+  case "$engine" in pgx|postgres|any) ;; *) die "engine must be pgx, postgres or any" ;; esac
+  trap on_signal INT TERM
+  trap finish EXIT
+  cd "$workdir"
+  framework=$(cat "$runtime/framework" 2>/dev/null || echo none)
+  [ "$framework_in" != auto ] && framework="$framework_in"
+  [ "$framework" = rails ] && rails_preflight
+  command -v jq > /dev/null || die "jq is required (preinstalled on GitHub-hosted runners)"
+  need_psql
+  timed cli install_cli
+  timed context resolve_context
+  check_gates
+  if [ "$mode" = fast ]; then fast; else production_like; fi
+}
+
+case "${1:-}" in
+  detect) detect ;;
+  run) main_run ;;
+  cleanup)
+    # Backstop for a run step that was killed before its own exit handler ran.
+    p=$(get prefix)
+    if [ -n "$p" ] && [ -z "$(get cleaned)" ] && command -v pgrun > /dev/null; then
+      export PGRUN_PROJECT="$(get project)"
+      delete_prefix "$p"; record cleaned 1
+    fi
+    rm -f "$runtime"/url_*
+    [ -z "$(get summary_written)" ] && { [ -n "$(get result)" ] || record result CANCELLED; write_summary; record summary_written 1; }
+    exit 0 ;;
+  *) echo "usage: pgrun-ci detect|run|cleanup" >&2; exit 64 ;;
+esac

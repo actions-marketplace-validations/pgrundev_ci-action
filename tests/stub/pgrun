@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Stub pgrun CLI for the lifecycle tests. State in $STUB_DIR; a "branch" is a
+# database on $TEST_PG_URL's server. Env: STUB_QUOTA (live branches allowed,
+# default 10), STUB_ENGINE (pgx), STUB_CREATE_FAIL, STUB_TEMPLATE_FAIL.
+set -euo pipefail
+dir="${STUB_DIR:?}"; mkdir -p "$dir/branches"
+base="${TEST_PG_URL%/*}"
+echo "$*" >> "$dir/calls"
+db_of() { echo "stub_$(echo "$1" | tr '-' '_')"; }
+case "$1 ${2:-}" in
+  "version "*) echo "pgrun 0.4.0" ;;
+  "branch create")
+    name=""; shift 2; shift   # project
+    while [ $# -gt 0 ]; do case "$1" in --name) name="$2"; shift 2 ;; *) shift ;; esac; done
+    [ -n "${STUB_CREATE_FAIL:-}" ] && { echo "error: $STUB_CREATE_FAIL" >&2; exit 1; }
+    live=$(ls "$dir/branches" | wc -l)
+    [ "$live" -ge "${STUB_QUOTA:-10}" ] && { echo "error: branch quota reached (10 live branches)" >&2; exit 1; }
+    psql "$TEST_PG_URL" -qc "DROP DATABASE IF EXISTS $(db_of "$name")" -c "CREATE DATABASE $(db_of "$name") TEMPLATE ${STUB_TEMPLATE_DB:-template1}" >/dev/null 2>&1
+    echo "${STUB_ENGINE:-pgx}" > "$dir/branches/$name"
+    echo "created $name" ;;
+  "branch list")
+    printf '{"branches":['; sep=""
+    for f in "$dir"/branches/*; do [ -e "$f" ] || continue; n=$(basename "$f")
+      printf '%s{"name":"%s","engine":"%s","connection_url":"%s/%s"}' "$sep" "$n" "$(cat "$f")" "$base" "$(db_of "$n")"; sep=","; done
+    printf ']}\n' ;;
+  "branch get") [ -e "$dir/branches/$4" ] && echo "name=$4 status=ready" || { echo "not found" >&2; exit 1; } ;;
+  "branch url") echo "DATABASE_URL=$base/$(db_of "$4")" ;;
+  "branch delete")
+    rm -f "$dir/branches/$4"; echo "$4" >> "$dir/deleted"
+    psql "$TEST_PG_URL" -qc "DROP DATABASE IF EXISTS $(db_of "$4") WITH (FORCE)" >/dev/null 2>&1 || true ;;
+  "template create") [ -n "${STUB_TEMPLATE_FAIL:-}" ] && { echo "template build failed" >&2; exit 1; }; echo "template ready" ;;
+  *) echo "stub pgrun: unsupported: $*" >&2; exit 64 ;;
+esac

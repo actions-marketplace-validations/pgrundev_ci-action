@@ -1,0 +1,33 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: shellcheck
+        run: shellcheck -S warning lib/pgrun-ci tests/*.sh
+      - name: python syntax
+        run: python3 -m py_compile lib/pgrun_profile.py
+      - name: profiler
+        env:
+          TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        run: bash tests/test_profile.sh
+      - name: lifecycle script
+        run: bash tests/test_lifecycle.sh
