@@ -30,4 +30,6 @@ jobs:
           TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: bash tests/test_profile.sh
       - name: lifecycle script
+        env:
+          TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: bash tests/test_lifecycle.sh

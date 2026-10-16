@@ -614,7 +614,7 @@ case "${1:-}" in
     # Backstop for a run step that was killed before its own exit handler ran.
     p=$(get prefix)
     if [ -n "$p" ] && [ -z "$(get cleaned)" ] && command -v pgrun > /dev/null; then
-      export PGRUN_PROJECT="$(get project)"
+      PGRUN_PROJECT=$(get project); export PGRUN_PROJECT
       delete_prefix "$p"; record cleaned 1
     fi
     rm -f "$runtime"/url_*

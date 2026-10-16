@@ -18,6 +18,7 @@ jq -n '{token: "good", status: 200, body: {project: {name: "app"}, source: {post
   protect: {status: "active", policy_version: 1}, safe_copy: {status: "ready", updated_at: (now | todate), policy_version: 1},
   pgx: {eligible: true}, allowances: []}}' > "$STUB_DIR/context.json"
 python3 "$here/stub/api.py" & api=$!
+# shellcheck disable=SC2154  # $db is the trap's own loop variable
 trap 'kill $api 2>/dev/null; for db in $(psql "$TEST_PG_URL" -Atc "SELECT datname FROM pg_database WHERE datname LIKE '"'"'stub\\_%'"'"'"); do psql "$TEST_PG_URL" -qc "DROP DATABASE $db WITH (FORCE)" >/dev/null 2>&1; done; rm -rf "$root"' EXIT
 for _ in $(seq 50); do [ -s "$STUB_DIR/api_port" ] && break; sleep 0.1; done
 
