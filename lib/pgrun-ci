@@ -193,11 +193,15 @@ check_gates() {
 }
 
 # --------------------------------------------------------------- branches
+# ci-<mode>-<pr|run>-<run id>-<attempt>-<job tag>: the random job tag keeps
+# two jobs of one run (a matrix, or two jobs in the same mode) apart, so one
+# job's cleanup never deletes another's branches. Recorded once per job.
 prefix() {
   local pr=""
   [[ "${GITHUB_REF:-}" =~ ^refs/pull/([0-9]+)/ ]] && pr="${BASH_REMATCH[1]}"
   local m; [ "$mode" = fast ] && m=fast || m=pl
-  echo "ci-$m-${pr:-run}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}" | tr 'A-Z' 'a-z'
+  local tag; tag=$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
+  echo "ci-$m-${pr:-run}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}-$tag" | tr 'A-Z' 'a-z'
 }
 
 our_branches() {   # names of this run's branches, never their URLs

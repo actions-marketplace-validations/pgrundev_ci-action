@@ -192,7 +192,22 @@ if [ "$(cat "$root/a.code")" = 0 ] && [ "$(cat "$root/b.code")" = 0 ] && grep -q
   ok "J: concurrent runs queue under the quota; each deletes only its own branches"
 else bad "J" "$(cat "$root/b.out")"; fi
 grep "^branch delete" "$STUB_DIR/calls" | awk '{print $4}' | sort > "$root/deleted"
-if grep -vqE '^ci-pl-7-200[12]-1-[0-9]+$' "$root/deleted"; then bad "J: a run deleted a branch it does not own" "$(cat "$root/deleted")"; else ok "J: deletions are scoped to the run's prefix"; fi
+if grep -vqE '^ci-pl-7-200[12]-1-[0-9a-f]{6}-[0-9]+$' "$root/deleted"; then bad "J: a run deleted a branch it does not own" "$(cat "$root/deleted")"; else ok "J: deletions are scoped to the run's prefix"; fi
+
+# Two jobs of ONE run (same run id and attempt, same token and mode, e.g. a
+# matrix): B finishes and cleans up while A is still migrating; A's branch survives.
+rm -f "$STUB_DIR/calls"
+( RUN_ID=2003 run_ci samerun-a PGRUN_API_TOKEN=good STUB_QUOTA=2 PGRUN_IN_MIGRATE_COMMAND="sleep 4; $MIG_ADD"; echo "$code" > "$root/sa.code"; echo "$out" > "$root/sa.out" ) &
+pa=$!
+sleep 1
+( RUN_ID=2003 run_ci samerun-b PGRUN_API_TOKEN=good STUB_QUOTA=2 PGRUN_IN_MIGRATE_COMMAND="$MIG_ADD"; echo "$code" > "$root/sb.code" ) &
+pb=$!
+wait "$pa" "$pb"
+grep "^branch delete" "$STUB_DIR/calls" | awk '{print $4}' | sort > "$root/deleted2"
+if [ "$(cat "$root/sa.code")" = 0 ] && [ "$(cat "$root/sb.code")" = 0 ] && [ "$(wc -l < "$root/deleted2" | tr -d ' ')" = 2 ] \
+   && [ "$(sort -u "$root/deleted2" | wc -l | tr -d ' ')" = 2 ] && [ "$(live_branches)" = 0 ]; then
+  ok "J: two jobs of the same run and token never delete each other's branches"
+else bad "J same run" "$(cat "$root/sa.out"; cat "$root/deleted2")"; fi
 
 # --------------------------------------------------------- cancellation
 cancel_test() {   # <name> <signal delay s> [VAR=value...]
