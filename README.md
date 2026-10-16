@@ -17,7 +17,7 @@ Your production database is never touched, and pull request code never sees a pr
 
 1. **Connect PostgreSQL and approve Protect in PGRun.** Connect the database, review the data-protection policy (what is masked, faked or removed), and approve it. PGRun then builds the sanitized **Safe Copy**.
 2. **Add a CI token to GitHub.**
-   1. In PGRun, open your project → **CI** → **Create CI token**.
+   1. In PGRun, open your project → **CI** → **Create CI token**, and choose how long it lasts (30, 90, 180 or 365 days). The action warns two weeks before it expires.
    2. In GitHub, go to repository **Settings → Secrets and variables → Actions → New repository secret**.
    3. Name it `PGRUN_API_TOKEN` and paste the token.
 3. **Add one workflow file** at `.github/workflows/pgrun.yml`:
@@ -131,7 +131,7 @@ Your whole test suite, in parallel. Each worker gets its own empty branch with t
           workers: 8
 ```
 
-- **Template:** built once, and rebuilt only when the production schema or your `seed` file changes.
+- **Template:** built once, and rebuilt only when the production schema or the seed changes. A CI token cannot set or change the seed, so a pull request cannot alter what every later CI branch starts from: an account manager sets it once with an account token (`pgrun template create <project> ci --schema-only --seed db/ci_seed.sql`). The `seed` input must then name the same file.
 - **Branches:** N are created from the template, and each gets your pull request's migrations.
 - **Rails preset:** with no `test-command`, test files are split into N groups and run as one process per branch, each with its own `DATABASE_URL`.
   - RSpec is used when `spec/` exists and `rspec-core` is in `Gemfile.lock`; otherwise Minitest.
@@ -162,7 +162,7 @@ Don't point your ordinary suite at production-like data: most tests assume empty
 | `migrate-command` | Rails: `bin/rails db:migrate` | For another framework, or a custom task. |
 | `prepare-command` | — | Fast: run on each branch after migrations. |
 | `workers` / `min-workers` | `4` / half | Fast: processes and branches. |
-| `seed` | — | Fast: SQL loaded into the CI template. |
+| `seed` | — | Fast: SQL loaded into the CI template. An account manager sets it once; a CI token can only use the same file (see Fast mode). |
 | `working-directory` | `.` | For a monorepo. |
 | `framework` | `auto` | `rails` or `none`. |
 | `setup-ruby` / `ruby-version` | `true` / auto | Set `setup-ruby: false` if your job already installed Ruby. |
@@ -199,7 +199,9 @@ Branches are named `ci-<mode>-<pr>-<run id>-<attempt>-<n>`, unique per run. Clea
 
 - **Least privilege.** Use a **CI token**, not an account token. A CI token:
   - belongs to one project;
-  - can create and delete that project's branches, and read the project's status;
+  - can create and delete the CI branches that CI tokens of that project created, and read the project's status; developers' branches are out of reach;
+  - cannot change a CI template's seed;
+  - expires on the date you chose, and can be revoked at any time;
   - cannot change data-protection policies, refresh or copy data, read the production connection, or see other projects.
 - **No production credentials in CI.** Branches are cut from the sanitized Safe Copy, and each branch has its own credentials. Code in the job can only reach the disposable branch.
 - **Migrations and tests run with `DATABASE_URL` only.** The PGRun token is not in their environment and never on a command line. Branch URLs and passwords are masked in logs. The data checks print names and counts, never row values.

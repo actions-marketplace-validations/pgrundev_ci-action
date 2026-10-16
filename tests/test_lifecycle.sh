@@ -84,6 +84,10 @@ run_ci badtoken PGRUN_API_TOKEN=wrong
 [ $code = 1 ] && grep -q "token was rejected (401)" <<< "$out" && [ "$(creates)" = 0 ] && ok "invalid token: actionable 401" || bad "invalid token" "$out"
 grep -q "auth=yes" "$STUB_DIR/api_calls" && ! grep -q wrong "$STUB_DIR/calls" 2>/dev/null && ok "token sent as a header, never on a pgrun argv" || bad "token header"
 
+jq '.status = 401 | .body = {error: "unauthorized", reason: "token_expired"}' "$STUB_DIR/context.json" > "$STUB_DIR/c" && mv "$STUB_DIR/c" "$STUB_DIR/context.json"
+run_ci expired PGRUN_API_TOKEN=good
+[ $code = 1 ] && grep -q "CI token has expired" <<< "$out" && [ "$(creates)" = 0 ] && ok "expired CI token: says so, creates nothing" || bad "expired token" "$out"
+
 jq '.status = 409 | .body = {error: "project_ambiguous", message: "this token can see 3 projects", projects: ["a", "b", "c"]}' "$STUB_DIR/context.json" > "$STUB_DIR/c" && mv "$STUB_DIR/c" "$STUB_DIR/context.json"
 run_ci ambiguous PGRUN_API_TOKEN=good
 [ $code = 1 ] && grep -q "set the action's \`project\` input to one of: a, b, c" <<< "$out" && ok "project discovery: several projects → names the choices" || bad "ambiguous" "$out"
@@ -115,6 +119,11 @@ run_ci fallback PGRUN_API_TOKEN=good STUB_ENGINE=postgres PGRUN_IN_MIGRATE_COMMA
 
 run_ci any PGRUN_API_TOKEN=good STUB_ENGINE=postgres PGRUN_IN_ENGINE=any PGRUN_IN_MIGRATE_COMMAND="$MIG_ADD"
 [ $code = 0 ] && ok "engine: any accepts stock PostgreSQL" || bad "engine any" "$out"
+
+jq '.body.token.expires_at = (now + 5 * 86400 | todate)' "$STUB_DIR/context.json" > "$STUB_DIR/c" && mv "$STUB_DIR/c" "$STUB_DIR/context.json"
+run_ci expiring PGRUN_API_TOKEN=good PGRUN_IN_MIGRATE_COMMAND="$MIG_ADD"
+[ $code = 0 ] && grep -q "CI token expires in [45] day" <<< "$out" && ok "a CI token near its expiry warns and still runs" || bad "expiring token" "$out"
+jq 'del(.body.token.expires_at)' "$STUB_DIR/context.json" > "$STUB_DIR/c" && mv "$STUB_DIR/c" "$STUB_DIR/context.json"
 
 run_ci valid PGRUN_API_TOKEN=good PGRUN_IN_MIGRATE_COMMAND="$MIG_ADD"
 summary=$(cat "$GITHUB_STEP_SUMMARY")

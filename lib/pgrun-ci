@@ -100,7 +100,10 @@ resolve_context() {
   code=$(api_get "/api/v1/ci/context$q" "$ctx")
   case "$code" in
     200) ;;
-    401) die "the PGRun API token was rejected (401). Create a CI token for the project in PGRun and store it as the PGRUN_API_TOKEN repository secret." ;;
+    401) if jq -e '.reason == "token_expired"' "$ctx" > /dev/null 2>&1; then
+           die "the PGRun CI token has expired. Create a new CI token for the project in PGRun and update the PGRUN_API_TOKEN repository secret."
+         fi
+         die "the PGRun API token was rejected (401). Create a CI token for the project in PGRun and store it as the PGRUN_API_TOKEN repository secret." ;;
     403) die "the PGRun API token may not use project ${project_in:-of this run} ($(jq -r '.message // .error // empty' "$ctx" 2>/dev/null))." ;;
     409) die "$(jq -r '.message // "this token can see several projects"' "$ctx") — set the action's \`project\` input to one of: $(jq -r '(.projects // []) | join(", ")' "$ctx")." ;;
     404) if jq -e '.error == "no_project"' "$ctx" > /dev/null 2>&1; then die "this PGRun account has no project yet: connect a database in PGRun first."; fi
@@ -112,6 +115,12 @@ resolve_context() {
   [ -n "$project" ] && [ "$project" != null ] || die "the PGRun API did not name a project"
   record project "$project"
   export PGRUN_PROJECT="$project"
+  # A CI token has a fixed lifetime: say so two weeks ahead, while it still works.
+  local days
+  days=$(jq -r '.token.expires_at // empty | fromdateiso8601? // empty | ((. - now) / 86400 | floor)' "$ctx" 2>/dev/null)
+  if [ -n "$days" ] && [ "$days" -lt 14 ]; then
+    echo "::warning title=PGRun CI token::the PGRun CI token expires in $days day(s). Create a new one in PGRun and update the PGRUN_API_TOKEN secret before then."
+  fi
 }
 
 legacy_context() {

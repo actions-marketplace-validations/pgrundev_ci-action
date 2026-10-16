@@ -4,7 +4,7 @@
 
 | Credential | Who sees it | What it can do |
 |---|---|---|
-| `PGRUN_API_TOKEN` (CI token) | The action's own steps. It is not in the environment of migrations or tests, and never on a command line or in a log. Code on the same runner can still obtain it (see below). | One project only: create, read and delete branches named `ci-…` (TTL capped at 6 hours; developers' branches are out of reach); define and build CI templates; read the project's Protect, Safe Copy and PGX status and its approved allowances. Format `pgrun_ci_…`; older PGRun releases reject it. |
+| `PGRUN_API_TOKEN` (CI token) | The action's own steps. It is not in the environment of migrations or tests, and never on a command line or in a log. Code on the same runner can still obtain it (see below). | One project only: create branches (named `ci-…`, TTL capped at 6 hours), and read or delete only the branches CI tokens of that project created, as recorded by the server; developers' branches are out of reach. Use and rebuild CI templates, but never set or change their seed; read the project's Protect, Safe Copy and PGX status and its approved allowances. Format `pgrun_ci_…`; older PGRun releases reject it. It expires after the 30, 90, 180 or 365 days chosen when it was created. |
 | Branch URL (`DATABASE_URL`) | Your migrations and tests. The URL and its password are masked in logs. | Full access to one disposable branch: a copy-on-write clone of the sanitized Safe Copy, with its own credentials and a TTL. |
 | Production database | Nobody in CI. | — |
 
@@ -33,7 +33,7 @@ A production-like branch holds the **sanitized** Safe Copy: what the approved Pr
 
 - **The data.** Their pull request's migrations and tests run against the branch with full access. Code can read any table and send it anywhere the runner can reach.
 - **The token.** They can edit the workflow in their branch to print it, or read it from the action's process at run time; GitHub-hosted runners give jobs `sudo`. Keeping the token out of the commands' environment stops accidental leaks, not a deliberate one.
-- **What a leaked CI token does.** It can create `ci-` branches of that one project, and so read the sanitized copy, until it is revoked. Each branch lives at most 6 hours. It can also change the project's CI template seed, which later CI branches start from. It cannot reach unmasked data, production, the policy, developers' branches, other projects, or approvals.
+- **What a leaked CI token does.** It can create `ci-` branches of that one project, and so read the sanitized copy, until it is revoked. Each branch lives at most 6 hours. It cannot reach unmasked data, production, the policy, developers' branches, other projects, or approvals.
 
 This is GitHub's model for every Actions secret, and no YAML condition changes it. The safeguards that do:
 
